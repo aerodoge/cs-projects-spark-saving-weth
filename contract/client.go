@@ -26,10 +26,10 @@ type Delegate struct {
 	address    common.Address
 	privateKey *ecdsa.PrivateKey
 	safe       common.Address
-	coboSafe   common.Address
+	argus      common.Address
 }
 
-func NewDelegate(rpcUrl, delegatePrivateKey, safeAddr, coboSafeAddr string) *Delegate {
+func NewDelegate(rpcUrl, delegatePrivateKey, safe, argus string) *Delegate {
 	client, err := ethclient.Dial(rpcUrl)
 	if err != nil {
 		log.Fatal(err)
@@ -43,13 +43,12 @@ func NewDelegate(rpcUrl, delegatePrivateKey, safeAddr, coboSafeAddr string) *Del
 		client:     client,
 		address:    address,
 		privateKey: privateKey,
-		safe:       common.HexToAddress(safeAddr),
-		coboSafe:   common.HexToAddress(coboSafeAddr),
+		safe:       common.HexToAddress(safe),
+		argus:      common.HexToAddress(argus),
 	}
 }
 
 func (d *Delegate) ApproveWETHToSpark(amount *big.Int) {
-	//assets, _ := new(big.Int).SetString("100000000000000000000", 10) // 100ETH
 	// approve
 	approveData, err := BuildApproveData(sparkAddress, amount)
 	if err != nil {
@@ -105,6 +104,117 @@ func (d *Delegate) Redeem(amount *big.Int) {
 	}
 }
 
+func (d *Delegate) ExecuteBatch(amount *big.Int) {
+	approveData, err := BuildApproveData(sparkAddress, amount)
+	if err != nil {
+		log.Printf("build WETH approve Error: %v\n", err)
+		return
+	}
+	depositData, err := BuildSparkDepositData(amount, d.safe, uint16(128))
+	if err != nil {
+		log.Printf("Build Spark Deposit Error: %v\n", err)
+		return
+	}
+
+	var addrs []common.Address
+	var values []*big.Int
+	var datas [][]byte
+	value1 := big.NewInt(0)
+	addrs = append(addrs, wethAddress)
+	values = append(values, value1)
+	datas = append(datas, approveData)
+
+	value2 := big.NewInt(0)
+	addrs = append(addrs, sparkAddress)
+	values = append(values, value2)
+	datas = append(datas, depositData)
+
+	txHash, err := d.batchExecuteSafeTransactions(addrs, values, datas)
+	if err != nil {
+		log.Printf("Execute WETH Approve Error: %v\n", err)
+		return
+	}
+
+	err = d.waitForConfirmation(txHash)
+	if err != nil {
+		log.Printf("Execute WETH Approve Error: %v\n", err)
+		return
+	}
+}
+
+func (d *Delegate) batchExecuteSafeTransactions(addrs []common.Address, values []*big.Int, datas [][]byte) (*common.Hash, error) {
+	if len(addrs) != len(datas) {
+		return nil, fmt.Errorf("len(addrs) != len(datas)")
+	}
+	callDatas := []SafeCallData{}
+	for i := range addrs {
+		callData := SafeCallData{
+			Flag:  big.NewInt(0),
+			To:    addrs[i],
+			Value: values[i],
+			Data:  datas[i],
+			Hint:  []byte{},
+			Extra: []byte{},
+		}
+		callDatas = append(callDatas, callData)
+	}
+
+	// 使用Safe ABI构建execTransactions调用数据
+	contractABI, err := abi.JSON(strings.NewReader(safeABI))
+	if err != nil {
+		return nil, fmt.Errorf("解析Safe ABI失败: %v", err)
+	}
+
+	// 使用ABI编码execTransactions调用
+	batchCallData, err := contractABI.Pack("execTransactions", callDatas)
+	if err != nil {
+		return nil, fmt.Errorf("编码批量交易数据失败: %v", err)
+	}
+
+	// 构建Safe交易
+	GasLimit := 6000000
+	// 获取nonce
+	nonce, err := d.client.PendingNonceAt(context.Background(), d.address)
+	if err != nil {
+		return nil, fmt.Errorf("获取nonce失败: %v", err)
+	}
+
+	// 获取gas价格
+	gasPrice, err := d.client.SuggestGasPrice(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("获取gas价格失败: %v", err)
+	}
+
+	tx := types.NewTransaction(
+		nonce,
+		d.argus,
+		big.NewInt(0),
+		uint64(GasLimit),
+		gasPrice,
+		batchCallData,
+	)
+
+	chainID, err := d.client.NetworkID(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("获取chain ID失败: %v", err)
+	}
+	fmt.Println("ChainID:", chainID)
+	// 签名交易
+	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), d.privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("签名交易失败: %v", err)
+	}
+
+	// 发送交易
+	err = d.client.SendTransaction(context.Background(), signedTx)
+	if err != nil {
+		return nil, fmt.Errorf("发送交易失败: %v", err)
+	}
+
+	hash := signedTx.Hash()
+	return &hash, nil
+}
+
 // 通过Safe执行交易x
 func (d *Delegate) executeSafeTransaction(to common.Address, value *big.Int, data []byte) (*common.Hash, error) {
 	// 构建Safe交易
@@ -127,7 +237,7 @@ func (d *Delegate) executeSafeTransaction(to common.Address, value *big.Int, dat
 	// 创建交易
 	tx := types.NewTransaction(
 		nonce,
-		d.coboSafe, // 发送到Cobo Safe合约
+		d.argus,
 		big.NewInt(0),
 		uint64(GasLimit),
 		gasPrice,
